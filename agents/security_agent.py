@@ -17,6 +17,7 @@ _resolver 和 _head_client 是为了测试注入，生产代码不传。
 from __future__ import annotations
 
 import ipaddress
+import logging
 import socket
 from dataclasses import dataclass
 from types import TracebackType
@@ -26,6 +27,13 @@ from urllib.parse import urlparse
 import httpx
 
 from config import Settings, get_settings
+
+log = logging.getLogger(__name__)
+
+# Well-known NAT64 prefix (RFC 6052). DNS64 会把公网 A 记录合成 AAAA。
+_NAT64_WELLKNOWN = ipaddress.IPv6Network("64:ff9b::/96")
+# IPv6 documentation (RFC 3849)，应拒绝，但不能用 ip.is_reserved：那会误伤 ::/8 里的 NAT64。
+_IPV6_DOCUMENTATION = ipaddress.IPv6Network("2001:db8::/32")
 
 
 # ---------------------------------------------------------------------------
@@ -71,31 +79,48 @@ class _HeadClient(Protocol):
 # ---------------------------------------------------------------------------
 # Private IP 判定
 # ---------------------------------------------------------------------------
+def _ipv4_is_blocked(ip: ipaddress.IPv4Address) -> bool:
+    return (
+        ip.is_private          # 10/8、172.16/12、192.168/16、127/8、169.254/16、100.64/10 等
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified    # 0.0.0.0
+        or ip.is_multicast      # 224/4 等
+        or ip.is_reserved       # 240/4 等
+    )
+
+
+def _unwrap_ipv6_embedded_v4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """把 IPv4-mapped / NAT64 合成地址还原成里面的 IPv4，再走 IPv4 SSRF 规则。"""
+    mapped = ip.ipv4_mapped
+    if mapped is not None:
+        return mapped
+    if ip in _NAT64_WELLKNOWN:
+        return ipaddress.IPv4Address(ip.packed[-4:])
+    return None
+
+
 def _is_private_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         # 解析出来的不是合法 IP（极端情况），当私有处理，保守拒绝
         return True
-    if isinstance(ip, ipaddress.IPv4Address):
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _unwrap_ipv6_embedded_v4(ip)
+        if embedded is not None:
+            return _ipv4_is_blocked(embedded)
         return (
-            ip.is_private          # 10/8、172.16/12、192.168/16、127/8、169.254/16、192.0.0/24 等
+            ip.is_private
             or ip.is_loopback
             or ip.is_link_local
-            or ip.is_unspecified    # 0.0.0.0
-            or ip.is_multicast      # 224/4 等
-            or ip.is_reserved       # 240/4 等
+            or ip.is_unspecified
+            or ip.is_multicast
+            or ip.is_site_local          # RFC 3879 废弃，但仍有实现会分配
+            or ip in _IPV6_DOCUMENTATION
+            # 不用 ip.is_reserved：CPython 把 ::/8 整段标 reserved，会误杀 64:ff9b::/96（DNS64）
         )
-    # IPv6
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_unspecified
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_site_local          # RFC 3879 废弃，但仍有实现会分配
-    )
+    return _ipv4_is_blocked(ip)
 
 
 # ---------------------------------------------------------------------------
@@ -198,21 +223,27 @@ async def validate_url(
         if _is_private_ip(ip):
             raise SSRFBlocked(f"Host {host!r} resolves to private/reserved IP {ip}")
 
-    # -------- 4. Content-Length 预检查（允许服务器不返回） --------
-    resp = await head_client(url)
+    # -------- 4. Content-Length 预检查（允许服务器不返回 / HEAD 失败） --------
+    # 很多源站不支持 HEAD 或会超时；按契约：拿不到大小就放行，交给 Aria2。
     try:
-        cl_raw = resp.headers.get("content-length")
-        if cl_raw is not None:
-            try:
-                cl = int(cl_raw)
-            except (TypeError, ValueError):
-                cl = None
-            if cl is not None and cl > settings.max_file_size_bytes:
-                raise FileTooLarge(
-                    f"File size {cl} bytes exceeds limit {settings.max_file_size_bytes} bytes"
-                )
-    finally:
-        await resp.aclose()
+        resp = await head_client(url)
+    except (httpx.HTTPError, OSError) as e:
+        log.warning("HEAD probe failed for %s: %s — skip size check", url, e)
+        resp = None
+    if resp is not None:
+        try:
+            cl_raw = resp.headers.get("content-length")
+            if cl_raw is not None:
+                try:
+                    cl = int(cl_raw)
+                except (TypeError, ValueError):
+                    cl = None
+                if cl is not None and cl > settings.max_file_size_bytes:
+                    raise FileTooLarge(
+                        f"File size {cl} bytes exceeds limit {settings.max_file_size_bytes} bytes"
+                    )
+        finally:
+            await resp.aclose()
 
     # -------- 5. 返回规范化 URL（把显式默认端口去掉） --------
     normalized = parsed._replace(fragment="").geturl()

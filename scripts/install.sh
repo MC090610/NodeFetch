@@ -208,6 +208,74 @@ manage() {
   bash "$MANAGE_SH" "$@"
 }
 
+api_base() {
+  local host="${API_HOST:-127.0.0.1}"
+  local port="${API_PORT:-8000}"
+  if [[ "$host" == "0.0.0.0" || "$host" == "::" || "$host" == "*" ]]; then
+    host="127.0.0.1"
+  fi
+  printf 'http://%s:%s' "$host" "$port"
+}
+
+json_get() {
+  # json_get <json> <key> — 只要顶层字符串/数字字段
+  local json="$1" key="$2"
+  ensure_python_bin
+  if [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]]; then
+    printf '%s' "$json" | "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1]); print("" if v is None else v)' "$key" 2>/dev/null || true
+  else
+    printf '%s' "$json" | sed -n "s/.*\"${key}\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+  fi
+}
+
+create_smoke_task() {
+  section_title "创建测试任务"
+  # 用真实小文件，而不是网站首页（example.com 只是 HTML，不能验证下载闭环）
+  local url="https://proof.ovh.net/files/1Mb.dat"
+  local fname="1Mb.dat"
+  local base http body tmp task_id status i
+  base="$(api_base)"
+  tmp="$(mktemp)"
+  info "POST ${base}/api/tasks"
+  info "source_url=${url}"
+  http="$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 25 \
+    -X POST "${base}/api/tasks" \
+    -H 'Content-Type: application/json' \
+    -d "{\"source_url\":\"${url}\",\"filename\":\"${fname}\"}" 2>/dev/null || echo 000)"
+  body="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+  info "HTTP ${http}"
+  info "响应：$(printf '%s' "$body" | tr -d '\n' | cut -c 1-400)"
+  if [[ "$http" != "201" ]]; then
+    err "创建失败（期望 HTTP 201）。若是 403 PRIVATE_IP_BLOCKED，看 SecurityAgent；连不上则先 Start。"
+    return 0
+  fi
+  task_id="$(json_get "$body" id)"
+  if [[ -z "$task_id" ]]; then
+    warn "响应里没有 task id，跳过轮询"
+    return 0
+  fi
+  info "轮询任务 ${task_id}（最多 ~20s，看 queued → downloading → completed）..."
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 2
+    body="$(curl -sS --max-time 5 "${base}/api/tasks/${task_id}" 2>/dev/null || true)"
+    status="$(json_get "$body" status)"
+    info "  [$i] status=${status:-unknown}"
+    case "$status" in
+      completed)
+        ok "测试任务完成"
+        info "$(printf '%s' "$body" | tr -d '\n' | cut -c 1-400)"
+        return 0
+        ;;
+      failed|expired)
+        err "测试任务失败：$(printf '%s' "$body" | tr -d '\n' | cut -c 1-400)"
+        return 0
+        ;;
+    esac
+  done
+  warn "20s 内未完成（1MB 在海外节点通常很快）。可用「列出所有任务」再查。"
+}
+
 log_file() {
   case "$1" in
     aria2) echo "$LOG_DIR/aria2.log" ;;
@@ -611,30 +679,23 @@ menu_tools() {
     section_title "工具菜单"
     local sel
     sel="$(menu "请选择" \
-      "创建测试任务|POST /api/tasks example.com" \
+      "创建测试任务|POST 1MB 文件并轮询到 completed" \
       "列出所有任务|GET /api/tasks?limit=10" \
       "清理 runtime|清空 logs/pids（停止后再运行）" \
       "升级 pip 依赖|venv pip install -U -r requirements" \
       "运行 pytest|跑全部测试" \
       "返回主菜单" )"
     case "$sel" in
-      0)
-        section_title "创建测试任务"
-        local body
-        body="$(curl -sS --max-time 5 -X POST "http://127.0.0.1:${API_PORT:-8000}/api/tasks" \
-          -H 'Content-Type: application/json' \
-          -d '{"source_url":"https://www.example.com/","filename":"example.html"}' 2>/dev/null || echo '{}')"
-        info "响应：$(printf '%s' "$body" | cut -c 1-400)"
-        ;;
+      0) create_smoke_task ;;
       1)
         section_title "列出任务（limit=10）"
         ensure_python_bin
         if [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]]; then
-          curl -sS --max-time 5 "http://127.0.0.1:${API_PORT:-8000}/api/tasks?limit=10" 2>/dev/null \
+          curl -sS --max-time 5 "$(api_base)/api/tasks?limit=10" 2>/dev/null \
             | "$PYTHON_BIN" -m json.tool 2>/dev/null \
             | sed 's/^/  | /' >"$UI_OUT" || true
         else
-          curl -sS --max-time 5 "http://127.0.0.1:${API_PORT:-8000}/api/tasks?limit=10" 2>/dev/null \
+          curl -sS --max-time 5 "$(api_base)/api/tasks?limit=10" 2>/dev/null \
             | sed 's/^/  | /' >"$UI_OUT" || true
         fi
         ;;

@@ -114,6 +114,38 @@ class TestPrivateIPv6Blocked:
             # 用 [] 包 IPv6
             await validate_url(f"http://[{ip}]/x.zip", _resolver=_resolver)
 
+    async def test_ipv4_mapped_public_is_allowed(self):
+        from agents.security_agent import validate_url
+        async def _hc(_u): return _MockHeadResponse(content_length=None)
+        def _resolver(h, p, f):
+            return [(10, 1, 6, b"", ("::ffff:93.184.216.34", p or 0, 0, 0))]
+        _, resolved = await validate_url(
+            "http://example.com/x.zip", _resolver=_resolver, _head_client=_hc,
+        )
+        assert resolved == ["::ffff:93.184.216.34"]
+
+    async def test_nat64_public_is_allowed(self):
+        """DNS64 常见合成地址 64:ff9b::x.x.x.x，内嵌公网 IPv4 时应放行。"""
+        from agents.security_agent import validate_url
+        async def _hc(_u): return _MockHeadResponse(content_length=None)
+        # 93.184.216.34 = 0x5db8d822
+        nat64 = "64:ff9b::5db8:d822"
+        def _resolver(h, p, f):
+            return [(10, 1, 6, b"", (nat64, p or 0, 0, 0))]
+        _, resolved = await validate_url(
+            "http://example.com/x.zip", _resolver=_resolver, _head_client=_hc,
+        )
+        assert resolved == [nat64]
+
+    async def test_nat64_private_is_blocked(self):
+        from agents.security_agent import SSRFBlocked, validate_url
+        # 192.168.1.1 = 0xc0a80101
+        nat64 = "64:ff9b::c0a8:101"
+        def _resolver(h, p, f):
+            return [(10, 1, 6, b"", (nat64, p or 0, 0, 0))]
+        with pytest.raises(SSRFBlocked):
+            await validate_url("http://internal.example/x.zip", _resolver=_resolver)
+
 
 # ---------------------------------------------------------------------------
 # DNS Rebinding：一个 host 解析到公网 + 私有，只要有私有必须拒绝
@@ -192,6 +224,23 @@ class TestMaxFileSize:
             _settings=self._small_settings(),
         )
         assert resolved
+
+    async def test_head_network_error_is_allowed(self):
+        """HEAD 超时/连不上不应 500，按「没有 Content-Length」放行。"""
+        import httpx
+        from agents.security_agent import validate_url
+
+        async def _hc(_u):
+            raise httpx.ConnectTimeout("simulated")
+
+        norm, resolved = await validate_url(
+            "https://example.com/file.zip",
+            _resolver=lambda _h, _p, _f: [(2, 1, 6, b"", ("93.184.216.34", 0))],
+            _head_client=_hc,
+            _settings=self._small_settings(),
+        )
+        assert resolved == ["93.184.216.34"]
+        assert norm.startswith("https://example.com/")
 
 
 # ---------------------------------------------------------------------------
