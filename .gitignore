@@ -26,3 +26,9 @@ pids/
 # Env
 .env
 .env.local
+
+#IDE
+.trae/
+
+#Other
+Agent.md
