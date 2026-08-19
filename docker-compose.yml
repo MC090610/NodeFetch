@@ -1,0 +1,80 @@
+# Node Agent + Aria2 单机 compose。
+#
+# 一键：
+#     cp .env.example .env
+#     # 改 .env 里的 ARIA2_RPC_SECRET / NODE_ID / NODE_TOKEN
+#     docker compose up -d
+#
+# 访问：
+#     http://localhost:8000/docs            Swagger
+#     http://localhost:8000/api/node/health 健康检查
+#
+# 下载内容卷：./data/downloads → 容器 /data/downloads
+# 数据库卷：    ./data/tasks.db   → sqlite
+
+services:
+  aria2:
+    image: p3terx/aria2-pro:latest
+    restart: unless-stopped
+    environment:
+      # 与 node-agent 的 .env 保持一致：
+      - RPC_SECRET=${ARIA2_RPC_SECRET:-replace_with_a_long_random_secret_change_me}
+      - RPC_PORT=6800
+      - LISTEN_PORT=6888
+      - DISK_CACHE=64M
+      - IPV6_MODE=false
+      # 下载目录（跟 node 容器共享同一个 volume）：
+      - DOWNLOAD_DIR=/data/downloads
+    volumes:
+      - downloads:/data/downloads
+      - aria2_conf:/config
+    ports:
+      - "6800:6800"       # RPC（Node 调）
+      - "6888:6888"       # DHT/BT/peer（可选对外开放）
+      - "6888:6888/udp"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-X", "POST",
+             "http://127.0.0.1:6800/jsonrpc",
+             "-H", "Content-Type: application/json",
+             "-d", "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${ARIA2_RPC_SECRET:-replace_with_a_long_random_secret_change_me}\"]}"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 3s
+
+  node-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    restart: unless-stopped
+    depends_on:
+      aria2:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # 覆盖为 compose 内部网络地址（aria2 是 service 名）
+      - ARIA2_RPC_URL=http://aria2:6800/rpc
+      - DOWNLOAD_DIR=/data/downloads
+      - DB_URL=sqlite+aiosqlite:////data/tasks.db
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    volumes:
+      - downloads:/data/downloads
+      - db_data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/node/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 8s
+
+volumes:
+  downloads:
+    driver: local
+  db_data:
+    driver: local
+  aria2_conf:
+    driver: local
